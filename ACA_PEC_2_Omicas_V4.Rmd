@@ -1,0 +1,789 @@
+---
+title: "PEC 2 - Análisis de datos Ómicos"
+author: "Alberto Castillo Aroca"
+date: "11/6/2020"
+output:
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  html_document:
+    theme: united
+    toc: yes
+    toc_depth: 3
+urlcolor: blue
+header-includes:
+- \usepackage{leading}
+- \leading{15pt}
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	cache = TRUE,
+	comment = NULL
+)
+```
+
+
+```{r echo=FALSE, message=FALSE}
+if(!require(BiocManager)) install.packages("BiocManager")
+if(!require(airway)) BiocManager::install("airway")
+if(!require(Rsamtools)) BiocManager::install("Rsamtools")
+if(!require(GenomicFeatures)) BiocManager::install("GenomicFeatures")
+if(!require(DESeq2)) BiocManager::install("DESeq2")
+if(!require(apeglm)) BiocManager::install("apeglm")
+if(!require(BiocParallel)) BiocManager::install("BiocParallel")
+if(!require(genefilter)) BiocManager::install("genefilter")
+if(!require(org.Hs.eg.db)) BiocManager::install("org.Hs.eg.db")
+if(!require(AnnotationDbi)) BiocManager::install("AnnotationDbi")
+if(!require(ReportingTools)) BiocManager::install("ReportingTools")
+if(!require(RUVSeq)) BiocManager::install("RUVSeq")
+if(!require(sva)) BiocManager::install("sva")
+if(!require(Gviz)) BiocManager::install("Gviz")
+
+if(!require(magrittr)) install.packages("magrittr", dep=TRUE)
+if(!require(dplyr)) install.packages("dplyr", dep=TRUE)
+if(!require(ggplot2)) install.packages("ggplot2", dep=TRUE)
+if(!require(pheatmap)) install.packages("pheatmap", dep=TRUE)
+if(!require(RColorBrewer)) install.packages("RColorBrewer", dep=TRUE)
+if(!require(ggbeeswarm)) install.packages("ggbeeswarm", dep=TRUE)
+
+```
+
+
+# 1. Abstract
+
+En el siguiente estudio se realiza un análisis de expresión diferenciada  (RNA-seq) con datos de tejidos de tiroides de tres tipos: Not infiltrated tissues (NIT), Small focal infiltrates (SFI), Extensive Lymphoid Infiltrates (ELI).
+
+Para la investigación se seleccionaron 10 muestras aleatorias de cada tipo desde una base de datos con 292 muestras totales. Posteriormente se realizó un análisis por pares, comparando NIT vs SFI, NIT vs ELI y SFI vs ELI.
+
+## Repositorio de GitHub: 
+
+# 2. Objetivos
+
+El objetivo del estudio fue identificar patrones diferenciados de expresión génica entre las muestras, específicamente genes sobre y sub expresados.
+
+# 3. Materiales y métodos
+
+## 3.1 Naturaleza de los datos
+
+Para la investigación se utilizó una base de datos procedente del Genotype-Tissue Expression (GTEx), los cuales fueron analizados con el software R 4.0 y la versión 3.11 de BiocManager / Bioconductor.
+
+Con estas herramientas se aplicaron métodos de pre-filtrado de los datos, estabilización de la varianza, análisis de conglomerados génicos, PCA, MDS y el análisis de expresión diferencial con el paquete DESeq2. Finalmente se procedió a visualizar los resultados y eliminar los efectos ocultos por bloques.
+
+## 3.2 Procedimiento general
+
+Para llevar a cabo el análisis se hicieron dos grandes procesos, el primero fue un análisis exploratorio con los datos estandarizados y la varianza estabilizada, posteriormente se utilizaron los datos brutos para realizar el análisis de expresión  diferencial.
+
+A continuación se describe el proceso general del análisis con una comparación entre NIT vs SFI, para posteriormente analizar los resultados de las tres comparaciones en el siguiente capítulo.
+
+
+### Naturaleza, importación y formato de los datos
+
+En este apartado es importante destacar que los datos utilizados constan de una matriz con información general de las muestras analizadas tales como el tipo de experimento, nombre de la muestra, grupo de análisis, tipo molecular, sexo de la persona analizada, entre otros.
+
+Por otra parte, se cuenta con una matriz de conteo que consiste en un conjunto de filas que refieren a códigos de ENSEMBL y un conjunto de columnas referentes a las muestras analizadas.
+
+Sin embargo, que los códigos de ENSEMBL cuentan con un sufijo referente a la versión del mismo, lo cual dificulta su anotación posterior. Por esta razón se procedió a eliminar dicho sufijo.
+
+```{r importando datos, message=FALSE, warning=FALSE}
+library(readr)
+targets <- read_delim("targets.csv", ";", 
+    escape_double = FALSE, trim_ws = TRUE)
+
+counts <- read_delim("counts.csv", ";", 
+    escape_double = FALSE, trim_ws = TRUE)
+
+counts=as.data.frame(counts)
+Ensembl = gsub("\\..*", "", counts$X1, fixed = FALSE)
+rownames(counts)=Ensembl
+
+```
+
+Con el fin de contar con un panel balanceado, se procedió a seleccionar 10 muestras de cada tipo según la matriz de características, con lo cual posteriormente se segmentó la matriz de conteo.
+
+```{r Muestra Aleatoria}
+#Observando los grupos
+table(targets$Group,targets$Grupo_analisis)
+
+set.seed(12345)
+m.eli=sample(1:14, 10, replace=F)
+m.nit=sample(1:236, 10, replace=F)
+m.sfi=sample(1:42, 10, replace=F)
+
+m.eli=targets[targets$Group=="ELI",][m.eli,]
+m.nit=targets[targets$Group=="NIT",][m.nit,]
+m.sfi=targets[targets$Group=="SFI",][m.sfi,]
+
+```
+
+
+En esta explicación del proceso se utilizaron los valores de las muestras de SFI/NIT y se utilizó la función DESeqDataSetFromMatrix para crear un objeto DESeqDataSet que permitiera ser analizado con el paquete DESeq2.
+
+```{r no 1}
+
+data.targets=rbind(m.sfi,m.nit)
+data.counts=counts[,data.targets$Sample_Name]
+
+data.targets$Group=factor(data.targets$Group)
+
+dds <- DESeqDataSetFromMatrix(countData = data.counts,
+                                  colData = data.targets,
+                                  design = ~ Group)
+
+
+```
+
+### Filtrado
+
+Cabe destacar no todas las filas poseen conteos, por esta razón y para optimizar memoria y costo de cómputo, se decidió hacer un prefiltrado, eliminando todas las filas que tuvieran 1 o menos conteos.
+
+```{r no 2}
+dds <- dds[ rowSums(counts(dds)) > 1, ]
+```
+
+### Análisis Exploratorio
+#### Estabilización de la varianza
+
+Con el fin de realizar un análisis exploratorio de los datos se decidió realizar un ajuste de la varianza, ya que el PCA y MDS funcionan mejor en escenarios e homocedasticidad. En vista de que la base de datos es pequeña (n<30), se hizo uso del método rlog debido a que este funciona mejor con un número reducido de muestras.
+
+```{r no 3}
+rld <- rlog(dds, blind = FALSE)
+
+```
+
+
+A continuación se presenta un diagrama de dispersión entre los datos de la primera y la segunda muestra de la base sin estabilización de la varianza y tras el proceso rlog, con lo cual se evidencia que los datos transformados presentan homocedasticidad.
+
+
+```{r no 4, echo=FALSE, fig.align='center', fig.height=6, fig.width=7, message=FALSE}
+dds <- estimateSizeFactors(dds)
+dn <- bind_rows(as.data.frame(assay(dds)[, 1:2]) %>% mutate(transformation = "Normal"))
+colnames(dn)[1:2] <- c("x", "y") 
+
+df <- bind_rows(as.data.frame(assay(rld)[, 1:2]) %>% mutate(transformation = "rlog SFI/NIT"))
+colnames(df)[1:2] <- c("x", "y")  
+
+ggplot(dn, aes(x = x, y = y)) + geom_hex(bins = 80) +
+  coord_fixed() + facet_grid( . ~ transformation)  
+
+ggplot(df, aes(x = x, y = y)) + geom_hex(bins = 80) +
+  coord_fixed() + facet_grid( . ~ transformation)  
+```
+
+
+#### Similitud entre las muestras
+
+Con estos datos homocedásticos se procedió a calcular las distancias entre las muestras para realizar un pheatmap que permite visualizar las muestras más similares y diferentes.
+
+Grosso modo se evidencia que existe mayor similitud entre las muestras de un mismo tipo, ya sea NIT o SFI.
+
+```{r no 5, echo=FALSE, fig.align='center', fig.height=4, fig.width=6, message=FALSE}
+sampleDists <- dist(t(assay(rld)))
+#sampleDists
+
+library("pheatmap")
+library("RColorBrewer")
+
+sampleDistMatrix <- as.matrix( sampleDists )
+rownames(sampleDistMatrix) <- paste( rld$Group,rownames(sampleDistMatrix), sep = " - " )
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+ph.graph=pheatmap(sampleDistMatrix,
+         clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists,
+         col = colors)
+ph.graph
+```
+
+#### PCA Plot
+
+Con el PCA plot de los datos con varianza estabilizada se puede observar la diferenciación de los tipos de muestras ya que este análisis maximiza la varianza entre estas y permite observar las diferencias existentes.
+
+El resultado demuestra que sí existen diferencias entre ambos tipos de muestras, por lo cual se puede presumir a priori que existe un patrón de expresión diferenciado.
+
+```{r no 6, fig.align='center', fig.width=5, fig.height=5}
+plotPCA(rld, intgroup = c("Group"))
+```
+
+
+#### MDS Plot
+
+También se hizo un gráfico de Multi-Dimensional Scaling (MDS) que permite tener una visualización de los patrones de similaridad entre los genes, para esto se dispuso de una matriz de distancias con la cual se obtiene un gráfico donde las distancias entre los puntos (genes) es equivalente a la similaridad.
+
+En este sentido, se observa que existe un agrupamiento de los genes de cada tipo de tejido, esto significa que existen similitudes intragrupales y diferencias extra-grupales, lo cual indica que se puede realizar un análisis de expresión diferencial.
+
+```{r no 7, fig.align='center', fig.width=5, fig.height=5}
+mds <- as.data.frame(colData(rld))  %>%
+         cbind(cmdscale(sampleDistMatrix))
+ggplot(mds, aes(x = `1`, y = `2`, color = Group)) +
+  geom_point(size = 3) + coord_fixed()
+```
+
+### Expresión diferencial
+
+En vista de que se confirmó que existen diferencias entre los tipos de muestras, se procedió a realizar un análisis de expresión diferencial con los datos brutos y el paquete DESeq2.
+
+Cabe la pena recordar que en este paso se deben utilizar los datos brutos para que las pruebas de hipótesis funcionen correctamente.
+
+En este paso se creó un nuevo objeto de tipo DESeqDataSet denominado ddsdeseq con base en los datos brutos dds. Posteriormente se aplicó la función results especificando que el contraste se hace entre los valores de la variable Group, específicamente entre NIT y SFI. En este sentido, NIT sería el numerador y SFI el denominador en la comparación.
+
+Este proceso incluye la estimación o uso de los tamaños pre-existentes de los factores, estimar la dispersión y utilizar la Negative Binomial GLM y utilizar el test de Wald para calcular los p-valores.
+
+El resultado es un objeto DESeqResults que posee el listado de códigos ENSEMBL, el bseMean, el Log2FoldChange, error estándar (lfcSE), el Test de Wald (stat), p-valor y p-valor ajustado por el método BH.
+
+```{r no 8, message=FALSE, warning=FALSE}
+ddsdeseq <- DESeq(dds, parallel =TRUE)
+res <- results(ddsdeseq, contrast=c("Group","SFI","NIT"))
+res
+```
+
+Este objeto permite identificar que de las 41299 observaciones, hay 166 (0.4%) sobre expresadas (up) y 834 (2%) subexpresadas, a un nivel de confianza de p-value<0.1
+
+```{r no 9}
+summary(res)
+```
+
+Por otra parte, si se requiere ajustar más el criterio y modificar el False Discovery Rate al 5%, sólo 711 observaciones estarían diferencialmente expresadas.
+
+```{r no 10}
+res.05 <- results(ddsdeseq, alpha = 0.05)
+table(res.05$padj < 0.05)
+```
+
+En cambio, si se toma sólamente el 5% de los valores del False Discovery Rate como valores significativos, la cantidad de genes diferencialmente expresados se ubica en 719.
+
+```{r no 11}
+sum(res$padj < 0.05, na.rm=TRUE)
+```
+
+Sin embargo, se mantendrá un valor de 0.1, debido a que este es el default del análisis, para crear una tabla con los valores diferencialmente expresados ordenados de acuerdo con el Log2FoldChange. Concretamente se presentarán los 5 más sub-regulados.
+
+Nota: cabe recordar que el Log2FoldChange permite evaluar si un gen está sobre o sub regulado.
+
+
+```{r no 12}
+resSig <- subset(res, padj < 0.1)
+head(resSig[ order(resSig$log2FoldChange), ])
+```
+
+A continuación se muestran los 5 genes más sobre-regulados.
+
+```{r no 13}
+head(resSig[ order(resSig$log2FoldChange, decreasing = TRUE), ])
+```
+
+Con estos resultados se puede graficar el conteo de los diversos genes entre los distintos grupos. Por ejemplo, se seleccionó el gen con menor p-valor ajustado: ENSG00000211677 y se puede observar que este presenta más conteos en el grupo SFI.
+
+Se debe recordar que por la fórmula de los resultados, SFI es asumido como el denominador en el Fold Change, por lo cual un mayor conteo en este daría un valor negativo, como se puede confirmar al final del script.
+
+```{r no 14}
+topGene <- rownames(res)[which.min(res$padj)]
+
+geneCounts <- plotCounts(ddsdeseq, gene = topGene, intgroup ="Group", returnData = TRUE)
+
+ggplot(geneCounts, aes(x = Group, y = count, color = Group, group = Group)) +
+  scale_y_log10() + geom_point(size = 3) + geom_line()
+
+#log2FoldChange
+res[rownames(res)=="ENSG00000211677","log2FoldChange"]
+```
+
+#### MA-Plot
+
+Por otra parte, se realizó un MA-Plot para observar los coeficientes estimados en el modelo, para esto se utilizó la librería apeglm que contrae el log2FoldChange. Así mismo se señala el gen con el menor p-valor ajustado.
+
+El resultado indica que en términos generales hay una sobre-regulación de la muestra SFI en comparación con la NIT.
+
+```{r no 15, message=FALSE}
+library("apeglm")
+resultsNames(ddsdeseq)
+
+res <- lfcShrink(ddsdeseq, coef="Group_SFI_vs_NIT", type="apeglm")
+
+plotMA(res, ylim = c(-5,5))
+topGene <- rownames(res)[which.min(res$padj)]
+with(res[topGene, ], {
+  points(baseMean, log2FoldChange, col="dodgerblue", cex=2, lwd=2)
+  text(baseMean, log2FoldChange, topGene, pos=2, col="dodgerblue")
+})
+```
+
+#### Clúster de genes
+
+A continuación se realizó un análisis de clúster de los 20 genes con mayor variabilidad, usando los datos con la varianza estabilizada con rlog. Esto permite evidenciar los genes que están más relacionados, lo cual es especialmente útil para la interpretación biológica del análisis.
+
+```{r no 18, fig.align='center', fig.height=4, fig.width=5, message=FALSE, warning=FALSE}
+library("genefilter")
+topVarGenes <- head(order(rowVars(assay(rld)), decreasing = TRUE), 20)
+
+mat  <- assay(rld)[topVarGenes, ]
+mat  <- mat - rowMeans(mat)
+anno <- as.data.frame(colData(rld)[, c("Group")])
+heatmap(mat, annotation_col = anno)
+```
+
+### Anotación de los resultados
+
+Continuando con los insumos para la interpretación biológica de este estudio, se procedió a hacer las anotaciones de los genes con los códigos ENSEMBL, para agregar el nombre del gen y el ENTREZID. Para esto se usó la función mapIds para agregar columnas con estos datos.
+
+```{r n19, message= FALSE}
+library("AnnotationDbi")
+columns(org.Hs.eg.db)
+```
+
+```{r n 20, Anotacion, message=FALSE, warning=FALSE}
+library("AnnotationDbi")
+row.names(res)=gsub("\\..*","",row.names(res))
+res$symbol = mapIds(org.Hs.eg.db,
+                    keys=row.names(res),
+                    column="SYMBOL",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+
+res$entrez = mapIds(org.Hs.eg.db,
+                    keys=row.names(res),
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+
+resOrdered <- res[order(res$pvalue),]
+head(resOrdered)
+```
+
+### Exportación de resultados
+
+Los resultados fueron finalmente exportados y se colocan a disposición del público en GitHub.
+
+```{r n 21}
+resOrderedDF <- as.data.frame(resOrdered)
+write.csv(resOrderedDF, file = "results_sfi_nit.csv")
+```
+
+### Remoción de efectos ocultos por lotes o batch effects
+
+Finalmente se procedió a remover los Batch Effects con la librería SVA, cuya función  svaseq permite iterar mínimos cuadrados ponderados para estimar variables sustitutas, con lo cual se estima la probabilidad de que ser un control, de este modo se detecta la varianza indeseada.
+
+Concretamente se usaron 5 iteraciones. Tras este proceso se detectaron las fuentes ocultas de variación entre grupos.
+
+```{r n 22, message=FALSE}
+library("sva")
+
+dat  <- counts(ddsdeseq, normalized = TRUE)
+idx  <- rowMeans(dat) > 1
+dat  <- dat[idx, ]
+mod  <- model.matrix(~ Group, colData(ddsdeseq))
+mod0 <- model.matrix(~   1, colData(ddsdeseq))
+svseq <- svaseq(dat, mod, mod0, n.sv = 2)
+
+svseq$sv
+```
+
+```{r n 23, fig.align='center', fig.width=7, fig.height=7}
+par(mfrow = c(2, 1), mar = c(3,5,3,1))
+for (i in 1:2) {
+  stripchart(svseq$sv[, i] ~ ddsdeseq$Group, vertical = TRUE, main = paste0("SV", i))
+  abline(h = 0)
+}
+```
+
+Finalmente los datos se utilizan para remover estos efectos en los datos, creando el objeto ddssva, el cual podrá ser utilizado para próximos análisis y estudios.
+
+```{r n 24}
+ddssva <- dds
+ddssva$SV1 <- svseq$sv[,1]
+ddssva$SV2 <- svseq$sv[,2]
+design(ddssva) <- ~ SV1 + SV2 + Group
+```
+
+
+# 4. Resultados
+
+Tras la detallada explicación de la metodología, a continuación se comparan los resultados de la comparación SFI/NIT, ELI/NIT y ELI/SFI.
+
+```{r resultados ejemplo, include=FALSE}
+rld.SFI_NIT=rld
+df.SFI_NIT=df
+ph.graph.SFI_NIT=ph.graph
+pca.SFI_NIT=plotPCA(rld, intgroup = c("Group"))
+mds.SFI_NIT=ggplot(mds, aes(x = `1`, y = `2`, color = Group)) +
+  geom_point(size = 3) + coord_fixed()
+res.SFI_NIT=res
+resSig.SFI_NIT=resSig
+mat.SFI_NIT=mat
+resOrdered.SFI_NIT=resOrdered
+svseq.SFI_NIT=svseq
+
+sufijos=c(".SFI_NIT",".ELI_NIT",".ELI_SFI")
+```
+
+## Estabilización de la varianza
+
+```{r varianza eli_nit, include=FALSE}
+
+data.targets.ELI_NIT=rbind(m.eli,m.nit)
+data.counts.ELI_NIT=counts[,data.targets.ELI_NIT$Sample_Name]
+
+data.targets.ELI_NIT$Group=factor(data.targets.ELI_NIT$Group)
+
+dds.ELI_NIT <- DESeqDataSetFromMatrix(countData = data.counts.ELI_NIT,
+                                  colData = data.targets.ELI_NIT,
+                                  design = ~ Group)
+
+
+
+dds.ELI_NIT <- dds.ELI_NIT[ rowSums(counts(dds.ELI_NIT)) > 1, ]
+
+rld.ELI_NIT <- rlog(dds.ELI_NIT, blind = FALSE)
+
+
+df.ELI_NIT <- bind_rows(as.data.frame(assay(rld.ELI_NIT)[, 1:2]) %>% mutate(transformation = "rlog ELI/NIT"))
+colnames(df.ELI_NIT)[1:2] <- c("x", "y")  
+
+ggplot(df.ELI_NIT, aes(x = x, y = y)) + geom_hex(bins = 80) +
+  coord_fixed() + facet_grid( . ~ transformation)  
+```
+
+
+
+```{r varianza eli_sfi, include=FALSE}
+
+data.targets.ELI_SFI=rbind(m.eli,m.sfi)
+data.counts.ELI_SFI=counts[,data.targets.ELI_SFI$Sample_Name]
+
+data.targets.ELI_SFI$Group=factor(data.targets.ELI_SFI$Group)
+
+dds.ELI_SFI <- DESeqDataSetFromMatrix(countData = data.counts.ELI_SFI,
+                                  colData = data.targets.ELI_SFI,
+                                  design = ~ Group)
+
+
+
+dds.ELI_SFI <- dds.ELI_SFI[ rowSums(counts(dds.ELI_SFI)) > 1, ]
+
+rld.ELI_SFI <- rlog(dds.ELI_SFI, blind = FALSE)
+
+
+df.ELI_SFI <- bind_rows(as.data.frame(assay(rld.ELI_SFI)[, 1:2]) %>% mutate(transformation = "rlog ELI/SFI"))
+colnames(df.ELI_SFI)[1:2] <- c("x", "y")  
+
+ggplot(df.ELI_SFI, aes(x = x, y = y)) + geom_hex(bins = 80) +
+  coord_fixed() + facet_grid( . ~ transformation)  
+```
+
+
+Como se puede observar, la varianza entre la primera y la segunda muestra de cada comparación es homocedástica, con lo cual se confirma que se realizó correctamente la estabilización de esta.
+
+```{r Varianza estabilizada}
+ggplot(rbind(df.SFI_NIT,df.ELI_NIT,df.ELI_SFI), aes(x = x, y = y)) + geom_hex(bins = 80) +
+  coord_fixed() + facet_grid( . ~ transformation)  
+```
+
+
+## Similitud entre muestras
+
+```{r Similitud entre todas las muestras, fig.align='center', fig.height=4, fig.width=6, message=FALSE, include=FALSE}
+sampleDists.ELI_NIT <- dist(t(assay(rld.ELI_NIT)))
+#sampleDists
+
+library("pheatmap")
+library("RColorBrewer")
+
+sampleDistMatrix.ELI_NIT <- as.matrix( sampleDists.ELI_NIT )
+rownames(sampleDistMatrix.ELI_NIT) <- paste( rld.ELI_NIT$Group,rownames(sampleDistMatrix.ELI_NIT), sep = " - " )
+colnames(sampleDistMatrix.ELI_NIT) <- NULL
+ph.graph.ELI_NIT=pheatmap(sampleDistMatrix.ELI_NIT,
+         clustering_distance_rows = sampleDists.ELI_NIT,
+         clustering_distance_cols = sampleDists.ELI_NIT,
+         col = colors)
+ph.graph.ELI_NIT
+
+sampleDists.ELI_SFI <- dist(t(assay(rld.ELI_SFI)))
+#sampleDists
+
+library("pheatmap")
+library("RColorBrewer")
+
+sampleDistMatrix.ELI_SFI <- as.matrix( sampleDists.ELI_SFI )
+rownames(sampleDistMatrix.ELI_SFI) <- paste( rld.ELI_SFI$Group,rownames(sampleDistMatrix.ELI_SFI), sep = " - " )
+colnames(sampleDistMatrix.ELI_SFI) <- NULL
+ph.graph.ELI_SFI=pheatmap(sampleDistMatrix.ELI_SFI,
+         clustering_distance_rows = sampleDists.ELI_SFI,
+         clustering_distance_cols = sampleDists.ELI_SFI,
+         col = colors)
+ph.graph.ELI_SFI
+
+
+```
+
+A continuación se muestran los pheatmap de las comparaciones SFI/NIT, ELI/NIT y ELI/SFI. Los resultados demuestran las muestras más parecidas en un azul más oscuro y con el dendograma se evidencian las aglomeraciones de estas. Como cabría esperar, las muestras de un mismo grupo se presentan más parecidas en términos generales, aunque se requiere un análisis a mayor profundidad sobre el significado biológico de esto.
+
+```{r }
+ph.graph.SFI_NIT
+```
+
+```{r}
+ph.graph.ELI_NIT
+```
+
+```{r}
+ph.graph.ELI_SFI
+```
+
+
+## PCA-Plot
+
+Los diagramas de dispersión entre la primera y segunda componente del PCA demuestran que en términos generales los grupos se pueden distinguir casi perfectamente, por lo cual se observa que es viable realizar un análisis de expresión diferencial.
+
+Se resalta que la comparción ELI/NIT fue la que presentó una mayor diferenciación, mientras que ELI/SFI presentó un mayor número de muestras cercanas, lo cual puede ser lógico por el aparente parentesco entre ambas patologías.
+
+```{r pca plot todos}
+
+plotPCA(rld.SFI_NIT, intgroup = c("Group"))
+plotPCA(rld.ELI_NIT, intgroup = c("Group"))
+plotPCA(rld.ELI_SFI, intgroup = c("Group"))
+
+```
+
+
+## MDS-Plot
+En cuanto a los gráficos del MDS, los resultados confirman el análisis realizado con el PCA. Ya que las muestras presentan diferencias evidentes, sin embargo la comparación ELI/SFI fue la que menos diferenciación presenta.
+```{r MDS todos, fig.align='center', fig.height=5, fig.width=5, include=FALSE}
+mds.ELI_NIT <- as.data.frame(colData(rld.ELI_NIT))  %>%
+         cbind(cmdscale(sampleDistMatrix.ELI_NIT))
+
+mds.ELI_SFI <- as.data.frame(colData(rld.ELI_SFI))  %>%
+         cbind(cmdscale(sampleDistMatrix.ELI_SFI))
+```
+
+```{r MDS Plot Todos}
+ggplot(mds, aes(x = `1`, y = `2`, color = Group)) +
+  geom_point(size = 3) + coord_fixed()
+
+ggplot(mds.ELI_NIT, aes(x = `1`, y = `2`, color = Group)) +
+  geom_point(size = 3) + coord_fixed()
+
+ggplot(mds.ELI_SFI, aes(x = `1`, y = `2`, color = Group)) +
+  geom_point(size = 3) + coord_fixed()
+```
+
+## Expresión diferencial
+
+```{r RESULTADOS TODOS, message=FALSE, warning=FALSE, include=FALSE}
+ddsdeseq.ELI_NIT <- DESeq(dds.ELI_NIT, parallel =TRUE)
+res.ELI_NIT <- results(ddsdeseq.ELI_NIT, contrast=c("Group","ELI","NIT"))
+
+ddsdeseq.ELI_SFI <- DESeq(dds.ELI_SFI, parallel =TRUE)
+res.ELI_SFI <- results(ddsdeseq.ELI_SFI, contrast=c("Group","ELI","SFI"))
+
+```
+
+Los resultados demuestran que 834 (2%) de los genes SFI están sobre regulados en comparación con los de las muestras NIT, así mismo 166 (0.4%) de estos están sub-regulados.
+
+En cambio, las mayores diferencias se obseran entre ELI y NIT, como se pudo apreciar en los gráficos, y es que 4105 (9.8%) genes ELI están sobre regulados mientras que 1941 (4.6%) están subregulados.
+
+Finalmente, también existen grandes diferencias entre ELI y SFI, ya que 1784 (4.2%) genes están sobre regulados y 575 (1.4%) están sub regulados.
+
+```{r SUMMARY RESULTADOS, echo=FALSE}
+print("SFI_NIT")
+summary(res.SFI_NIT)
+print("ELI_NIT")
+summary(res.ELI_NIT)
+print("ELI_SFI")
+summary(res.ELI_SFI)
+```
+
+Cabe destacar que el análisis biológico sobre el significado de estos genes y estas diferencias, está por fuera del alcance de este estudio, ya que el proposito es primordialmente técnico.
+
+## Plot-Counts
+
+```{r include=FALSE}
+pc.SFI_NIT=ggplot(geneCounts, aes(x = Group, y = count, color = Group, group = Group)) +
+  scale_y_log10() + geom_point(size = 3) + geom_line()
+
+
+topGene.ELI_NIT <- rownames(res.ELI_NIT)[which.min(res.ELI_NIT$padj)]
+
+geneCounts.ELI_NIT <- plotCounts(ddsdeseq.ELI_NIT, gene = topGene.ELI_NIT, intgroup ="Group", returnData = TRUE)
+
+pc.ELI_NIT=ggplot(geneCounts.ELI_NIT, aes(x = Group, y = count, color = Group, group = Group)) +
+  scale_y_log10() + geom_point(size = 3) + geom_line()
+
+topGene.ELI_SFI <- rownames(res.ELI_SFI)[which.min(res.ELI_SFI$padj)]
+
+geneCounts.ELI_SFI <- plotCounts(ddsdeseq.ELI_SFI, gene = topGene.ELI_SFI, intgroup ="Group", returnData = TRUE)
+
+pc.ELI_SFI=ggplot(geneCounts.ELI_SFI, aes(x = Group, y = count, color = Group, group = Group)) +
+  scale_y_log10() + geom_point(size = 3) + geom_line()
+
+
+```
+
+
+A continuación se muestra el plot count para el gen con menor p-valor ajustado de cada comparación.
+
+En el primer caso (SFI/NIT) se observa que el conteo es mayor en en SFI, por lo cual este gen está sobre-regulado. En el segundo (ELI/SFI), se evidencia que el conteo es superior en ELI, por lo cual está sub-regulado. Finalmente, en el último caso (ELI/SFI) también el conteo es superior en ELI por lo cual está sobre regulado.
+
+Cabe destacar que estas comparaciones son realizadas con genes diferentes, por lo cual no se puede analizar los tres gráficos en conjunto.
+
+```{r PlotCounts todos}
+topGene
+pc.SFI_NIT
+
+topGene.ELI_NIT
+pc.ELI_NIT
+
+topGene.ELI_SFI
+pc.ELI_SFI
+```
+
+
+## MA - Plot
+
+En cuanto al MA-Plot este no ofreció mayor información sobre los distintos grupos. Por esta razón se prescinde de su utilización.
+
+## Clúster de Genes
+
+A continuación se muestra un análisis de clúster de los genes con menor p-valor, es decir de aquellos cuya diferencia fue más estadísticamente significativa. Cabe destacar que esta presentación no se analiza a mayor profundidad debido a que corresponde a un equipo de biólogos y genetistas realizar la evaluación de la significancia biológica de estos datos.
+
+```{r Gene clustering phgraph todos, echo=FALSE, message=FALSE, warning=FALSE}
+library("genefilter")
+heatmap(mat, annotation_col = anno, main = "SFI/NIT")
+
+topVarGenes.ELI_NIT <- head(order(rowVars(assay(rld.ELI_NIT)), decreasing = TRUE), 20)
+
+mat.ELI_NIT  <- assay(rld.ELI_NIT)[topVarGenes.ELI_NIT, ]
+mat.ELI_NIT  <- mat.ELI_NIT - rowMeans(mat.ELI_NIT)
+anno.ELI_NIT <- as.data.frame(colData(rld.ELI_NIT)[, c("Group")])
+
+
+heatmap(mat.ELI_NIT, annotation_col = anno.ELI_NIT, main = "ELI/NIT")
+
+topVarGenes.ELI_SFI <- head(order(rowVars(assay(rld.ELI_SFI)), decreasing = TRUE), 20)
+
+mat.ELI_SFI  <- assay(rld.ELI_SFI)[topVarGenes.ELI_SFI, ]
+mat.ELI_SFI  <- mat.ELI_SFI - rowMeans(mat.ELI_SFI)
+anno.ELI_SFI <- as.data.frame(colData(rld.ELI_SFI)[, c("Group")])
+
+
+heatmap(mat.ELI_SFI, annotation_col = anno.ELI_SFI, main = "ELI/NIT")
+
+```
+
+
+## Remoción de Batch Effects
+
+Para finalizar, se hace una remoción de los Batch Effects de las tres muestras, con lo cual se podrá contar con bases con una detección de las fuentes de variación ocultas.
+
+```{r batch effects todos, message=FALSE, include=FALSE}
+library("sva")
+
+dat.ELI_NIT  <- counts(ddsdeseq.ELI_NIT, normalized = TRUE)
+idx.ELI_NIT  <- rowMeans(dat.ELI_NIT) > 1
+dat.ELI_NIT  <- dat.ELI_NIT[idx, ]
+mod.ELI_NIT  <- model.matrix(~ Group, colData(ddsdeseq.ELI_NIT))
+mod0.ELI_NIT <- model.matrix(~   1, colData(ddsdeseq.ELI_NIT))
+svseq.ELI_NIT <- svaseq(dat.ELI_NIT, mod.ELI_NIT, mod0.ELI_NIT, n.sv = 2)
+
+dat.ELI_SFI  <- counts(ddsdeseq.ELI_SFI, normalized = TRUE)
+idx.ELI_SFI  <- rowMeans(dat.ELI_SFI) > 1
+dat.ELI_SFI  <- dat.ELI_SFI[idx, ]
+mod.ELI_SFI  <- model.matrix(~ Group, colData(ddsdeseq.ELI_SFI))
+mod0.ELI_SFI <- model.matrix(~   1, colData(ddsdeseq.ELI_SFI))
+svseq.ELI_SFI <- svaseq(dat.ELI_SFI, mod.ELI_SFI, mod0.ELI_SFI, n.sv = 2)
+
+```
+
+```{r graficos batch effects, echo=FALSE, fig.align='center', fig.height=7, fig.width=7}
+
+par(mfrow = c(2, 1), mar = c(3,5,3,1))
+for (i in 1:2) {
+  stripchart(svseq$sv[, i] ~ ddsdeseq$Group, vertical = TRUE, main = paste0("SV (SFI/NIT)", i))
+  abline(h = 0)
+}
+
+par(mfrow = c(2, 1), mar = c(3,5,3,1))
+for (i in 1:2) {
+  stripchart(svseq.ELI_NIT$sv[, i] ~ ddsdeseq.ELI_NIT$Group, vertical = TRUE, main = paste0("SV (ELI/NIT)", i))
+  abline(h = 0)
+}
+
+par(mfrow = c(2, 1), mar = c(3,5,3,1))
+for (i in 1:2) {
+  stripchart(svseq.ELI_SFI$sv[, i] ~ ddsdeseq.ELI_SFI$Group, vertical = TRUE, main = paste0("SV (ELI/SFI)", i))
+  abline(h = 0)
+}
+
+```
+
+## Anotación y exportación de resultados
+
+```{r Anotacion todos, include=FALSE}
+library("AnnotationDbi")
+
+row.names(res.ELI_NIT)=gsub("\\..*","",row.names(res.ELI_NIT))
+res.ELI_NIT$symbol = mapIds(org.Hs.eg.db,
+                    keys=row.names(res.ELI_NIT),
+                    column="SYMBOL",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+
+res.ELI_NIT$entrez = mapIds(org.Hs.eg.db,
+                    keys=row.names(res.ELI_NIT),
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+
+resOrdered.ELI_NIT <- res.ELI_NIT[order(res.ELI_NIT$pvalue),]
+
+
+row.names(res.ELI_SFI)=gsub("\\..*","",row.names(res.ELI_SFI))
+res.ELI_SFI$symbol = mapIds(org.Hs.eg.db,
+                    keys=row.names(res.ELI_SFI),
+                    column="SYMBOL",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+
+res.ELI_SFI$entrez = mapIds(org.Hs.eg.db,
+                    keys=row.names(res.ELI_SFI),
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+
+resOrdered.ELI_SFI <- res.ELI_SFI[order(res.ELI_SFI$pvalue),]
+
+
+```
+
+
+```{r resultados anotacion, echo=FALSE}
+print(sufijos[1])
+head(resOrdered)
+
+print(sufijos[2])
+head(resOrdered.ELI_NIT)
+
+print(sufijos[3])
+head(resOrdered.ELI_SFI)
+```
+
+
+```{r exportando todos los datos, include=FALSE}
+resOrderedDF <- as.data.frame(resOrdered)
+write.csv(resOrderedDF, file = "results_sfi_nit.csv")
+
+resOrderedDF.ELI_NIT <- as.data.frame(resOrdered.ELI_NIT)
+write.csv(resOrderedDF.ELI_NIT, file = "results_eli_nit.csv")
+
+resOrderedDF.ELI_SFI <- as.data.frame(resOrdered.ELI_SFI)
+write.csv(resOrderedDF.ELI_SFI, file = "results_eli_sfi.csv")
+```
+
+# Discusión
+Los resultados de cada comparación fueron exportados en archivos .csv que pueden ser consultados en el repositorio de GitHub de este estudio.
+
+# Conclusiones
+
+Se requiere continuar el estudio con un análisis de la significancia biológica de los resultados.
